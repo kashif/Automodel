@@ -481,59 +481,6 @@ def eager_attention_with_sink(
     return torch.matmul(probs, value_states).transpose(1, 2).contiguous(), probs
 
 
-def sdpa_attention_with_sink(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    """SDPA attention equivalent to :func:`eager_attention_with_sink`.
-
-    The sink is represented as one extra key/value slot per head. Its key and
-    value are zero, and its per-head logit is injected through the additive
-    SDPA mask. This keeps the sink in the softmax denominator without adding
-    anything to the weighted value sum.
-    """
-    del kwargs
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-    batch, heads, query_len, head_dim = query.shape
-    key_len = key_states.shape[-2]
-
-    sink_key = torch.zeros((batch, heads, 1, head_dim), dtype=key_states.dtype, device=key_states.device)
-    sink_value = torch.zeros(
-        (batch, heads, 1, value_states.shape[-1]),
-        dtype=value_states.dtype,
-        device=value_states.device,
-    )
-    key_states = torch.cat([key_states, sink_key], dim=-2)
-    value_states = torch.cat([value_states, sink_value], dim=-2)
-
-    sink_mask = module.sinks.view(1, heads, 1, 1).expand(batch, heads, query_len, 1).to(query.dtype)
-    if attention_mask is None:
-        base_mask = torch.zeros((batch, heads, query_len, key_len), dtype=query.dtype, device=query.device)
-    else:
-        base_mask = attention_mask[:, :, :, :key_len].to(query.dtype)
-        if base_mask.shape[1] == 1 and heads != 1:
-            base_mask = base_mask.expand(batch, heads, query_len, key_len)
-    sdpa_mask = torch.cat([base_mask, sink_mask], dim=-1)
-
-    attn_output = F.scaled_dot_product_attention(
-        query,
-        key_states,
-        value_states,
-        attn_mask=sdpa_mask,
-        dropout_p=dropout if module.training else 0.0,
-        is_causal=False,
-        scale=scaling,
-    )
-    return attn_output.transpose(1, 2).contiguous(), None
-
-
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -1004,8 +951,7 @@ class DeepseekV4Attention(nn.Module):
             )
             attn_weights = None
         else:
-            attention_impl = sdpa_attention_with_sink if self.backend.attn == "sdpa" else eager_attention_with_sink
-            attn_output, attn_weights = attention_impl(
+            attn_output, attn_weights = eager_attention_with_sink(
                 self,
                 q,
                 full_kv,
