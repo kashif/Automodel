@@ -198,3 +198,19 @@ class TestDeepSeekV4StateDictAdapterToHF:
         assert adapter._is_non_quantized("ffn.gate.bias")
         assert adapter._is_non_quantized("ffn.gate.tid2eid")
         assert adapter._is_non_quantized("attn.attn_sink")
+
+    def test_trim_state_dict_for_checkpoint_load_drops_missing_attn_sink_only(self):
+        adapter = _make_adapter()
+        sd = {
+            "layers.0.attn.attn_sink": torch.zeros(4),
+            "layers.0.attn.wq_a.weight": torch.zeros(32, 64),
+            "layers.1.attn.attn_sink": torch.ones(4),
+        }
+        out = adapter.trim_state_dict_for_checkpoint_load(
+            sd,
+            checkpoint_keys={"layers.0.attn.wq_a.weight", "layers.1.attn.attn_sink"},
+        )
+
+        assert "layers.0.attn.attn_sink" not in out
+        assert "layers.0.attn.wq_a.weight" in out
+        assert "layers.1.attn.attn_sink" in out
