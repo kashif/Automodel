@@ -35,11 +35,26 @@ from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 logger = logging.getLogger(__name__)
 
-# Well-known kernels-community repos (see https://huggingface.co/kernels-community).
+# Well-known kernels-community repos (see https://huggingface.co/kernels-community/kernels).
 HUB_FLASH_ATTN2 = "kernels-community/flash-attn2"
 HUB_FLASH_ATTN3 = "kernels-community/flash-attn3"
 HUB_FLASH_ATTN4 = "kernels-community/flash-attn4"
 HUB_LIGER_KERNELS = "kernels-community/liger-kernels"
+HUB_MAMBA_SSM = "kernels-community/mamba-ssm"
+HUB_CAUSAL_CONV1D = "kernels-community/causal-conv1d"
+HUB_MEGABLOCKS = "kernels-community/megablocks"
+HUB_FLA = "kernels-community/fla"
+HUB_ACTIVATION = "kernels-community/activation"
+HUB_ROTARY = "kernels-community/rotary"
+
+# P0/P1 repos to lock in container images (see docs/investigations/kernels-hub-integration.md).
+RECOMMENDED_LOCK_REPOS: tuple[str, ...] = (
+    HUB_FLASH_ATTN2,
+    HUB_LIGER_KERNELS,
+    HUB_ACTIVATION,
+    HUB_ROTARY,
+    HUB_MAMBA_SSM,
+)
 
 _HAS_KERNELS_LIB, _kernels_mod = safe_import("kernels")
 HAS_KERNELS_LIB = _HAS_KERNELS_LIB

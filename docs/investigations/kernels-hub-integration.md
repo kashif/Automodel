@@ -150,7 +150,7 @@ Caveats discovered in AutoModel code:
 |---|---|---|---|
 | HF attention (FA2/3/4) | `flash-attn` pip package | ✅ `kernels-community/flash-attn{2,3,4}` | Transformers handles wrapper; AutoModel needs availability + fallback fixes |
 | Liger (RMSNorm, MLP, Linear, loss) | `liger_kernel` pip | ✅ `kernels-community/liger-kernels` | Transformers `use_kernels=True` replaces `_patch_liger_kernel` |
-| Mamba / GDN conv | `mamba-ssm`, `causal-conv1d` | ✅ `kernels-community/mamba-ssm` | Already in transformers default mapping |
+| Mamba / GDN conv | `mamba-ssm`, `causal-conv1d` | ✅ `kernels-community/mamba-ssm` | Includes `causal_conv1d_*`, selective scan, Mamba2 |
 | Activations (GELU, SiLU) | PyTorch / TE | ✅ `kernels-community/activation` | Inference + compile modes |
 | RoPE | TE fused / torch | ✅ `kernels-community/rotary` | TE fused RoPE currently force-disabled (#3027) |
 | MoE expert GEMM | TE / grouped_gemm / torch_mm | ⚠️ `kernels-community/megablocks` | Different API; not a drop-in for DeepEP path |
@@ -159,8 +159,139 @@ Caveats discovered in AutoModel code:
 | TE attention / FP8 | `transformer-engine` | ❌ | NVIDIA proprietary; stays as direct dep |
 | DeepEP / UCCL-EP | `deep_ep` | ❌ | Not in kernels-community |
 | TileLang (DSV4, GLM-DSA) | `tilelang`, `tile-kernels` | ❌ | Custom NVIDIA/vendor kernels |
-| FLA (linear attention) | `flash-linear-attention` | ❓ | Check Hub; not in transformers default map |
+| FLA (linear attention) | `flash-linear-attention` | ✅ `kernels-community/fla` | Hub repo exists; not in transformers default map yet |
 | FlexAttn / MagiAttention | PyTorch / custom | ❌ | Custom CP dispatch |
+| Quantization (BNB/GPTQ) | `bitsandbytes` pip | ⚠️ `kernels-community/quantization-*` | CPU-focused Hub builds; evaluate for QLoRA |
+| FP8 GEMM | TE / torchao | ⚠️ `kernels-community/finegrained-fp8`, `deep-gemm` | Experimental; not TE-compatible |
+
+---
+
+## Full `kernels-community` Catalog (54 kernels)
+
+Source: [kernels-community/kernels](https://huggingface.co/kernels-community/kernels) via `GET https://huggingface.co/api/kernels?author=kernels-community` (2026-07-24). Source repos live in [huggingface/kernels-community](https://github.com/huggingface/kernels-community).
+
+Legend: **P0** = high-priority AutoModel integration candidate · **P1** = useful secondary · **P2** = niche / future · **—** = no direct AutoModel path today
+
+### Attention & sequence ops
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`flash-attn2`](https://huggingface.co/kernels-community/flash-attn2) | cuda,xpu,cpu | **P0** | `flash_attn_func`, `flash_attn_varlen_func`, packed/KV APIs — replaces `fa` pip |
+| [`flash-attn3`](https://huggingface.co/kernels-community/flash-attn3) | cuda | **P0** | Hopper FA3; also `vllm-flash-attn3`, `sgl-flash-attn3` variants |
+| [`flash-attn4`](https://huggingface.co/kernels-community/flash-attn4) | cuda | **P1** | Beta FA4; conflicts with tilelang ffi pin in current container |
+| [`flash-attn-ops`](https://huggingface.co/kernels-community/flash-attn-ops) | cuda,rocm,xpu | **P1** | `cross_entropy_loss`, `rms_norm_fn`, `apply_rotary` — auxiliary FA ecosystem ops |
+| [`flash-mla`](https://huggingface.co/kernels-community/flash-mla) | cuda | **P2** | Multi-latent attention (DeepSeek-style MLA kernels) |
+| [`sage-attention`](https://huggingface.co/kernels-community/sage-attention) | cuda | **P2** | Approximate attention |
+| [`paged-attention`](https://huggingface.co/kernels-community/paged-attention) | cuda,rocm,metal | **P2** | Inference paging; vLLM-style serving |
+| [`vllm-flash-attn3`](https://huggingface.co/kernels-community/vllm-flash-attn3) | cuda | **P2** | vLLM-flavored FA3 build |
+| [`sgl-flash-attn3`](https://huggingface.co/kernels-community/sgl-flash-attn3) | cuda | **P2** | SGLang-flavored FA3 + varlen |
+| [`aiter-flash-attn`](https://huggingface.co/kernels-community/aiter-flash-attn) | rocm | **P2** | AMD AITER flash attention |
+| [`aiter-flash-attn-ck`](https://huggingface.co/kernels-community/aiter-flash-attn-ck) | rocm | **P2** | AMD composable-kernel FA |
+| [`metal-flash-sdpa`](https://huggingface.co/kernels-community/metal-flash-sdpa) | metal | **P2** | Apple Metal SDPA |
+| [`msa`](https://huggingface.co/kernels-community/msa) | cuda | **P2** | Block-sparse attention (`sparse_atten_func`); transformers has dedicated wrapper |
+| [`mra`](https://huggingface.co/kernels-community/mra) | cuda | **P2** | Multi-resolution attention |
+| [`yoso`](https://huggingface.co/kernels-community/yoso) | cuda | **P2** | Efficient attention variant |
+
+### Normalization, activations, RoPE
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`liger-kernels`](https://huggingface.co/kernels-community/liger-kernels) | cuda,rocm,xpu | **P0** | `LigerRMSNorm`, SwiGLU/GEGLU MLP, `LigerLinear`, causal LM loss — replaces `_patch_liger_kernel` |
+| [`activation`](https://huggingface.co/kernels-community/activation) | cuda,metal,cpu | **P1** | `silu_and_mul`, `gelu_and_mul`, GELU variants — transformers default for activations |
+| [`rotary`](https://huggingface.co/kernels-community/rotary) | cuda,xpu,cpu | **P1** | `apply_rotary_transformers` — transformers default RoPE on CUDA/XPU |
+| [`aiter-rope`](https://huggingface.co/kernels-community/aiter-rope) | rocm | **P2** | AMD RoPE |
+| [`layer-norm`](https://huggingface.co/kernels-community/layer-norm) | cuda | **P1** | LayerNorm/RMSNorm Triton builds |
+| [`rmsnorm`](https://huggingface.co/kernels-community/rmsnorm) | xpu,cpu | **P2** | Intel XPU RMSNorm (transformers default on XPU) |
+| [`tinygrad-rms`](https://huggingface.co/kernels-community/tinygrad-rms) | cuda | **P2** | Alternative RMSNorm |
+| [`relu`](https://huggingface.co/kernels-community/relu) | all | **P2** | Cross-platform ReLU (highest download count — generic) |
+
+### SSM / linear attention / RWKV
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`mamba-ssm`](https://huggingface.co/kernels-community/mamba-ssm) | cuda | **P0** | `selective_scan_fn`, `causal_conv1d_*`, `Mamba2` — replaces `mamba-ssm` + `causal-conv1d` pip |
+| [`causal-conv1d`](https://huggingface.co/kernels-community/causal-conv1d) | cuda | **P1** | Standalone conv1d (also bundled in `mamba-ssm`) |
+| [`fla`](https://huggingface.co/kernels-community/fla) | cuda | **P1** | Flash-linear-attention ops — replaces `flash-linear-attention` pip for GDN/linear-attn models |
+| [`rwkv`](https://huggingface.co/kernels-community/rwkv) | cuda | **P2** | RWKV time-mix kernels |
+
+### MoE & GEMM
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`megablocks`](https://huggingface.co/kernels-community/megablocks) | cuda,rocm,xpu,cpu | **P1** | `MegaBlocksMoeMLP`, dropless MoE — transformers default MoE MLP; **not** DeepEP-compatible |
+| [`megablocks-rocm`](https://huggingface.co/kernels-community/megablocks-rocm) | rocm | **P2** | ROCm megablocks variant |
+| [`triton-kernels`](https://huggingface.co/kernels-community/triton-kernels) | cuda | **P1** | Triton MoE routing/SwiGLU (`swiglu`, `routing`) — mxfp4/bf16 |
+| [`triton-moe`](https://huggingface.co/kernels-community/triton-moe) | — | **P2** | MoE-specific Triton ops |
+| [`scattermoe`](https://huggingface.co/kernels-community/scattermoe) | cuda,rocm,xpu | **P2** | Scatter MoE kernels |
+| [`sonic-moe`](https://huggingface.co/kernels-community/sonic-moe) | cuda | **P2** | `KernelBackendMoE`, routing kernels |
+| [`vllm-moe`](https://huggingface.co/kernels-community/vllm-moe) | cuda | **P2** | vLLM MoE kernels |
+| [`deep-gemm`](https://huggingface.co/kernels-community/deep-gemm) | cuda | **P2** | DeepSeek GEMM kernels |
+| [`gemm`](https://huggingface.co/kernels-community/gemm) | — | **P2** | Generic GEMM |
+| [`triton-scaled-mm`](https://huggingface.co/kernels-community/triton-scaled-mm) | — | **P2** | Scaled matmul (quant) |
+
+### Quantization & FP8
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`quantization-bitsandbytes`](https://huggingface.co/kernels-community/quantization-bitsandbytes) | cpu | **P1** | BNB quant kernels — evaluate vs pip `bitsandbytes` for QLoRA |
+| [`quantization-gptq`](https://huggingface.co/kernels-community/quantization-gptq) | cpu | **P2** | GPTQ CPU kernels |
+| [`quantization-eetq`](https://huggingface.co/kernels-community/quantization-eetq) | cuda | **P2** | EETQ quant |
+| [`finegrained-fp8`](https://huggingface.co/kernels-community/finegrained-fp8) | cuda,rocm,xpu | **P2** | FP8 quant kernels |
+| [`fp8-fbgemm`](https://huggingface.co/kernels-community/fp8-fbgemm) | cuda,rocm,xpu | **P2** | FBGEMM FP8 |
+
+### Vision / diffusion / domain-specific
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`deformable-detr`](https://huggingface.co/kernels-community/deformable-detr) | cuda | **P2** | Deformable attention — transformers default for DETR-style models |
+| [`cv-utils`](https://huggingface.co/kernels-community/cv-utils) | cuda | **P2** | CV helper kernels |
+| [`trimul-gpumode`](https://huggingface.co/kernels-community/trimul-gpumode) | cuda,rocm,xpu | **P2** | AlphaFold TriMul |
+| [`punica-sgmv`](https://huggingface.co/kernels-community/punica-sgmv) | cuda | **P2** | Multi-LoRA SGMV (serving) |
+
+### Platform-specific (Metal / ROCm AITER / GPT-OSS)
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`gpt-oss-triton-kernels`](https://huggingface.co/kernels-community/gpt-oss-triton-kernels) | cuda,rocm,xpu | **P1** | GPT-OSS model-specific Triton kernels |
+| [`gpt-oss-metal-kernels`](https://huggingface.co/kernels-community/gpt-oss-metal-kernels) | metal | **P2** | GPT-OSS on Apple Metal |
+| [`mlx-rmsnorm`](https://huggingface.co/kernels-community/mlx-rmsnorm) | metal | **P2** | MLX RMSNorm |
+| [`mlx-quantization-metal-kernels`](https://huggingface.co/kernels-community/mlx-quantization-metal-kernels) | metal | **P2** | MLX quant |
+| [`bitsandbytes-mps`](https://huggingface.co/kernels-community/bitsandbytes-mps) | metal | **P2** | BNB on MPS |
+| [`aiter-kernels`](https://huggingface.co/kernels-community/aiter-kernels) | rocm | **P2** | AMD AITER kernel bundle |
+
+### Optimizer / misc
+
+| Hub repo | Drivers | AutoModel | Notes |
+|---|---|---|---|
+| [`adam-atan2`](https://huggingface.co/kernels-community/adam-atan2) | — | **P2** | Optimizer kernel |
+
+### Suggested `kernels lock` set for AutoModel containers
+
+Minimum set covering HF training path without compiled `flash-attn` or `liger-kernel`:
+
+```bash
+kernels lock \
+  kernels-community/flash-attn2 \
+  kernels-community/liger-kernels \
+  kernels-community/activation \
+  kernels-community/rotary \
+  kernels-community/mamba-ssm
+kernels download
+```
+
+Extended set for MoE + linear-attention + native-model experiments:
+
+```bash
+kernels lock \
+  kernels-community/flash-attn2 \
+  kernels-community/flash-attn3 \
+  kernels-community/liger-kernels \
+  kernels-community/megablocks \
+  kernels-community/mamba-ssm \
+  kernels-community/fla \
+  kernels-community/triton-kernels
+kernels download
+```
 
 ---
 
@@ -270,6 +401,6 @@ RUN uv pip install "kernels>=0.11.0" \
 - [Kernels docs — Quickstart](https://huggingface.co/docs/kernels/en/basic-usage)
 - [Transformers — Loading kernels](https://huggingface.co/docs/transformers/main/kernel_doc/loading_kernels)
 - [Transformers `hub_kernels.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/hub_kernels.py)
-- [kernels-community/flash-attn2](https://huggingface.co/kernels-community/flash-attn2)
-- [kernels-community/liger-kernels](https://huggingface.co/kernels-community/liger-kernels)
+- [kernels-community catalog (54 kernels)](https://huggingface.co/kernels-community/kernels)
+- [kernels-community source repo](https://github.com/huggingface/kernels-community)
 - AutoModel: `nemo_automodel/components/kernels/hub.py`, `nemo_automodel/_transformers/kernel_patches.py`, `nemo_automodel/components/models/common/utils.py` (`BackendConfig`)
