@@ -128,7 +128,9 @@ class NoisyStream(nn.Module):
         scale = torch.rsqrt(alpha.square() / self.diffusion_dim + sigma.square()).unsqueeze(-1)
         angles = self.gamma(t).float().unsqueeze(-1) * self.time_frequencies
         time_features = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        return self.latent_in(latents.float() * scale) + self.time_in(time_features)
+        # Upcast the weights at use so the stream stays fp32 under a bf16 FSDP mixed-precision policy (Sigma App. E).
+        hidden = F.linear(latents.float() * scale, self.latent_in.weight.float())
+        return hidden + F.linear(time_features, self.time_in.weight.float())
 
 
 def _noisy_stream_hook(embedding: nn.Module, args: tuple[Any, ...], output: torch.Tensor) -> torch.Tensor:
