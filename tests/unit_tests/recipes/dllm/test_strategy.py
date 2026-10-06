@@ -30,6 +30,7 @@ from nemo_automodel.components.loss.dllm_loss import (
     SCDDLoss,
     UnoDistillLoss,
 )
+from nemo_automodel.components.speculative.sigma_uno import NoisyStream, attach_noisy_stream
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
     BlockDiffusionStrategy,
@@ -38,6 +39,7 @@ from nemo_automodel.recipes.dllm.strategy import (
     IDLMStrategy,
     MDLMStrategy,
     SCDDStrategy,
+    SigmaUnoStrategy,
     UnoStrategy,
     _build_target_layer_ids,
     get_dllm_strategy,
@@ -998,6 +1000,116 @@ def test_dflash_forward_backward_fallback_skips_mask_for_single_sdpa_block():
     )
 
     assert "attention_mask" not in draft.last_kwargs
+
+
+class TestSigmaUnoStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return SigmaUnoStrategy()
+
+    def test_resolves_from_registry(self):
+        assert isinstance(get_dllm_strategy("sigma_uno"), SigmaUnoStrategy)
+
+    def test_create_loss_fn_reads_p_rec_and_keeps_the_uno_loss(self, strategy):
+        loss_fn = strategy.create_loss_fn({"block_length": 4, "p_rec": 0.2})
+        assert isinstance(loss_fn, UnoDistillLoss)
+        assert (strategy.p_rec, strategy.block_size) == (0.2, 4)
+        with pytest.raises(ValueError, match="p_rec"):
+            SigmaUnoStrategy().create_loss_fn({"p_rec": 1.0})
+
+    def test_apply_corruption_keeps_token_ids_clean(self, strategy):
+        input_ids = torch.randint(0, 50, (2, 8))
+        loss_mask = torch.zeros(2, 8, dtype=torch.long)
+        loss_mask[:, 4:] = 1
+        noisy, noise_mask, p_mask = strategy.apply_corruption(
+            input_ids, loss_mask, 999, eps=1e-3, block_size=None, half_life_ratio=None
+        )
+        assert torch.equal(noisy, input_ids)
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert torch.equal(p_mask, torch.ones(2, 8))
+
+    def test_forward_backward_feeds_the_noisy_stream_to_the_gated_half(self, strategy):
+        """x_0 logits are the frozen base on clean ids; only LoRA and the noisy stream train."""
+        torch.manual_seed(0)
+        vocab, seq_len = 32, 6
+        loss_fn = strategy.create_loss_fn({"block_length": 2, "loss_chunk_size": 4})
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.q_proj = torch.nn.Linear(8, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa", hidden_size=8)
+
+            def get_input_embeddings(self):
+                return self.embed
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                return types.SimpleNamespace(logits=self.head(self.q_proj(self.embed(input_ids))))
+
+        model = _TinyModel()
+        stream = attach_noisy_stream(model)
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        stream.requires_grad_(True)  # freeze_config.unfreeze_modules
+        torch.nn.init.normal_(stream.time_proj.weight, std=0.5)
+
+        seen = {}
+
+        def recording_loss(logits, *args, **kwargs):
+            seen["logits"] = logits.detach()
+            return loss_fn(logits, *args, **kwargs)
+
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=recording_loss,
+            _dllm_loss_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True
+        batch = {"_clean_input_ids": clean, "_noisy_input_ids": clean.clone(), "_noise_mask": noise_mask}
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe, 0, batch, loss_buffer=loss_buffer, num_diffusion_tokens=int(noise_mask.sum()), num_batches=1
+        )
+
+        with torch.no_grad():
+            hidden = model.embed(clean)
+            base = model.head(torch.nn.functional.linear(hidden, model.q_proj.weight, model.q_proj.bias))
+        torch.testing.assert_close(seen["logits"][:, seq_len:], base)
+        assert not torch.allclose(seen["logits"][:, seq_len // 2 : seq_len], base[:, seq_len // 2 :])
+        assert stream._t is None and model.q_proj._lora_token_gate is None
+        assert len(loss_buffer) == 1 and torch.isfinite(loss_buffer[0])
+        trained = {name for name, p in model.named_parameters() if p.grad is not None}
+        assert trained == {
+            "q_proj.lora_A.weight",
+            "q_proj.lora_B.weight",
+            "embed.sigma_noisy_stream.embedding",
+            "embed.sigma_noisy_stream.input_proj.weight",
+            "embed.sigma_noisy_stream.time_proj.weight",
+        }
+
+    def test_setup_extra_requires_a_trainable_noisy_stream(self, strategy):
+        strategy.create_loss_fn({"block_length": 2})
+        model = torch.nn.Embedding(4, 2)
+        model.get_input_embeddings = lambda: model
+        model.config = types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=4)
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1), model_parts=[model], mask_token_id=0
+        )
+        with pytest.raises(ValueError, match="from_pretrained_with_noisy_stream"):
+            strategy.setup_extra(recipe)
+        model.config.hidden_size = 2
+        model.sigma_noisy_stream = NoisyStream(4, 2).requires_grad_(False)
+        with pytest.raises(ValueError, match="unfreeze_modules"):
+            strategy.setup_extra(recipe)
 
 
 class TestDFlashSampleAnchorBlocks:

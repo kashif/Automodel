@@ -32,7 +32,7 @@ from __future__ import annotations
 import bisect
 import logging
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import Dict, Tuple
 
 import torch
@@ -62,6 +62,7 @@ from nemo_automodel.components.loss.dllm_loss import (
     UnoDistillLoss,
     scdd_schedule,
 )
+from nemo_automodel.components.speculative.sigma_uno import noisy_stream_inputs, sample_block_times
 
 logger = logging.getLogger(__name__)
 
@@ -512,7 +513,7 @@ class IDLMStrategy(DLLMStrategy):
             mask_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
+        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids, noise_mask):
             out = model(
                 input_ids=concat_input_ids,
                 attention_mask=block_mask,
@@ -530,12 +531,15 @@ class IDLMStrategy(DLLMStrategy):
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
 
-    def _forward_context(self, model: nn.Module, noisy_input_ids: torch.Tensor) -> AbstractContextManager:
+    def _forward_context(
+        self, model: nn.Module, noisy_input_ids: torch.Tensor, noise_mask: torch.Tensor
+    ) -> AbstractContextManager:
         """Context entered around the ``[x_t | x_0]`` forward and backward; none for I-DLM.
 
         Args:
             model: The trained model part.
             noisy_input_ids: Tensor of shape [batch, sequence] holding the ``x_t`` copy.
+            noise_mask: Bool Tensor of shape [batch, sequence] marking corrupted (supervised) positions.
 
         Returns:
             A context manager covering both the forward and the backward pass.
@@ -730,12 +734,15 @@ class UnoStrategy(IDLMStrategy):
             input_ids, loss_mask, self._noise_high, block_size=None, eps=1.0, generator=generator
         )
 
-    def _forward_context(self, model: nn.Module, noisy_input_ids: torch.Tensor) -> AbstractContextManager:
+    def _forward_context(
+        self, model: nn.Module, noisy_input_ids: torch.Tensor, noise_mask: torch.Tensor
+    ) -> AbstractContextManager:
         """Gate the LoRA adapter on for the ``x_t`` half of the ``[x_t | x_0]`` sequence.
 
         Args:
             model: The LoRA-patched model part.
             noisy_input_ids: Tensor of shape [batch, sequence] holding the ``x_t`` copy.
+            noise_mask: Bool Tensor of shape [batch, sequence] marking corrupted (supervised) positions.
 
         Returns:
             :func:`lora_token_gate` context with a bool gate of shape [batch, 2 * sequence].
@@ -758,6 +765,73 @@ class UnoStrategy(IDLMStrategy):
         return recipe.dllm_loss_fn(
             logits, noise_mask, valid_mask, seq_len=seq_len, num_diffusion_tokens=num_diffusion_tokens
         )
+
+
+class SigmaUnoStrategy(UnoStrategy):
+    """Strategy for Sigma-Uno: Uno with Sigma's continuous latent diffusion as the noisy stream.
+
+    Identical to :class:`UnoStrategy` (gated LoRA, I-DLM causal block mask, :class:`UnoDistillLoss` against
+    the frozen clean half, block-size curriculum) except for the ``x_t`` input. Instead of uniform random token
+    ids, every supervised position of the noisy half is fed the Sigma diffusion stream
+    (:mod:`nemo_automodel.components.speculative.sigma_uno`): a unit-norm 16-D embedding of the clean token,
+    noised as ``z_t = alpha_t e + sigma_t eps`` with one ``t`` per block (``t = 0`` w.p. ``dllm.p_rec``,
+    else ``U[0, 1]``; Sigma Alg. 1, lines 3-6), up-projected and time-conditioned. Token ids stay clean.
+
+    Requires the model to carry a ``NoisyStream`` (``model._target_`` set to
+    :func:`~nemo_automodel.components.speculative.sigma_uno.from_pretrained_with_noisy_stream`) kept trainable
+    by ``freeze_config.unfreeze_modules``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.p_rec = 0.1
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        self.p_rec = float(dllm_cfg.get("p_rec", 0.1))
+        if not 0.0 <= self.p_rec < 1.0:
+            raise ValueError(f"dllm.p_rec must be in [0, 1), got {self.p_rec}.")
+        return super().create_loss_fn(dllm_cfg)
+
+    def setup_extra(self, recipe) -> None:
+        super().setup_extra(recipe)
+        stream = getattr(recipe.model_parts[0].get_input_embeddings(), "sigma_noisy_stream", None)
+        if stream is None:
+            raise ValueError("Sigma-Uno needs a model built by from_pretrained_with_noisy_stream.")
+        if not all(p.requires_grad for p in stream.parameters()):
+            raise ValueError("The Sigma-Uno noisy stream is frozen; add it to freeze_config.unfreeze_modules.")
+
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        """Keep the token ids clean; the noise is added in embedding space by the noisy stream.
+
+        Returns:
+            ``(input_ids, noise_mask, p_mask)``: a copy of the clean ids, the supervised positions and all-ones
+            ``p_mask``, each a Tensor of shape [batch, sequence].
+        """
+        noise_mask = loss_mask.bool()
+        return input_ids.clone(), noise_mask, torch.ones_like(input_ids, dtype=torch.float32)
+
+    def _forward_context(
+        self, model: nn.Module, noisy_input_ids: torch.Tensor, noise_mask: torch.Tensor
+    ) -> AbstractContextManager:
+        """Gate the LoRA on for the ``x_t`` half and feed that half's supervised positions from the noisy stream.
+
+        Args:
+            model: The LoRA-patched model part carrying the noisy stream.
+            noisy_input_ids: Tensor of shape [batch, sequence] holding the clean ids of the ``x_t`` copy.
+            noise_mask: Bool Tensor of shape [batch, sequence] marking supervised positions.
+
+        Returns:
+            One context covering the LoRA gate and the noisy-stream inputs.
+        """
+        stream = model.get_input_embeddings().sigma_noisy_stream
+        t = sample_block_times(noise_mask, self.block_size, p_rec=self.p_rec)
+        eps = torch.randn(*noisy_input_ids.shape, stream.diffusion_dim, device=noisy_input_ids.device)
+        stack = ExitStack()
+        stack.enter_context(super()._forward_context(model, noisy_input_ids, noise_mask))
+        stack.enter_context(noisy_stream_inputs(model, t, noise_mask, eps=eps))
+        return stack
 
 
 class DFlashStrategy(DLLMStrategy):
@@ -1389,6 +1463,7 @@ DLLM_STRATEGIES: Dict[str, type] = {
     "hybrid": HybridStrategy,
     "idlm": IDLMStrategy,
     "uno": UnoStrategy,
+    "sigma_uno": SigmaUnoStrategy,
     "dflash": DFlashStrategy,
     "block_diffusion": BlockDiffusionStrategy,
 }
