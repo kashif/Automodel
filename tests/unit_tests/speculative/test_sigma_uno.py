@@ -52,14 +52,14 @@ def test_unit_embedding_rows_lie_on_the_sphere():
     torch.testing.assert_close(stream.unit_embedding().norm(dim=-1), torch.ones(32))
 
 
-def test_time_projection_starts_at_zero():
+def test_time_inection_starts_at_zero():
     """Sigma App. E: the time features enter through a zero-initialized layer."""
     stream = NoisyStream(32, 8)
     latents = torch.randn(1, 3, 16)
     t = torch.rand(1, 3)
     alpha, sigma = stream.alpha_sigma(t)
     scale = torch.rsqrt(alpha.square() / 16 + sigma.square()).unsqueeze(-1)
-    torch.testing.assert_close(stream(latents, t), stream.input_proj(latents * scale))
+    torch.testing.assert_close(stream(latents, t), stream.latent_in(latents * scale))
 
 
 def test_sample_block_times_shares_t_within_a_block_and_zeroes_unsupervised():

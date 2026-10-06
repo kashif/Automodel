@@ -38,7 +38,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components._peft.lora import lora_token_gate
+from nemo_automodel.components._peft.lora import LinearLoRA, lora_token_gate
 from nemo_automodel.components.attention.idlm_mask import (
     create_idlm_block_mask,
     create_idlm_sdpa_mask,
@@ -797,6 +797,8 @@ class SigmaUnoStrategy(UnoStrategy):
         stream = getattr(recipe.model_parts[0].get_input_embeddings(), "sigma_noisy_stream", None)
         if stream is None:
             raise ValueError("Sigma-Uno needs a model built by from_pretrained_with_noisy_stream.")
+        if any(isinstance(module, LinearLoRA) for module in stream.modules()):
+            raise ValueError("peft.target_modules matched the Sigma-Uno noisy stream; add it to peft.exclude_modules.")
         if not all(p.requires_grad for p in stream.parameters()):
             raise ValueError("The Sigma-Uno noisy stream is frozen; add it to freeze_config.unfreeze_modules.")
 

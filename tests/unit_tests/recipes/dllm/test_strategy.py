@@ -1050,9 +1050,10 @@ class TestSigmaUnoStrategy:
 
         model = _TinyModel()
         stream = attach_noisy_stream(model)
-        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        # "*_proj" as in the Uno recipes: the stream's own linears must not match it.
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["*_proj"], dim=4, alpha=8, use_triton=False))
         stream.requires_grad_(True)  # freeze_config.unfreeze_modules
-        torch.nn.init.normal_(stream.time_proj.weight, std=0.5)
+        torch.nn.init.normal_(stream.time_in.weight, std=0.5)
 
         seen = {}
 
@@ -1092,8 +1093,8 @@ class TestSigmaUnoStrategy:
             "q_proj.lora_A.weight",
             "q_proj.lora_B.weight",
             "embed.sigma_noisy_stream.embedding",
-            "embed.sigma_noisy_stream.input_proj.weight",
-            "embed.sigma_noisy_stream.time_proj.weight",
+            "embed.sigma_noisy_stream.latent_in.weight",
+            "embed.sigma_noisy_stream.time_in.weight",
         }
 
     def test_setup_extra_requires_a_trainable_noisy_stream(self, strategy):
@@ -1109,6 +1110,13 @@ class TestSigmaUnoStrategy:
         model.config.hidden_size = 2
         model.sigma_noisy_stream = NoisyStream(4, 2).requires_grad_(False)
         with pytest.raises(ValueError, match="unfreeze_modules"):
+            strategy.setup_extra(recipe)
+        model.sigma_noisy_stream.requires_grad_(True)
+        apply_lora_to_linear_modules(
+            model.sigma_noisy_stream, PeftConfig(match_all_linear=True, dim=1, alpha=1, use_triton=False)
+        )
+        model.sigma_noisy_stream.requires_grad_(True)
+        with pytest.raises(ValueError, match="exclude_modules"):
             strategy.setup_extra(recipe)
 
 

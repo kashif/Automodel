@@ -73,9 +73,9 @@ class NoisyStream(nn.Module):
         self.gamma_min = float(gamma_min)
         self.gamma_max = float(gamma_max)
         self.embedding = nn.Parameter(torch.randn(vocab_size, self.diffusion_dim))
-        self.input_proj = nn.Linear(self.diffusion_dim, hidden_size, bias=False)
-        self.time_proj = nn.Linear(2 * NUM_TIME_FREQUENCIES, hidden_size, bias=False)
-        nn.init.zeros_(self.time_proj.weight)
+        self.latent_in = nn.Linear(self.diffusion_dim, hidden_size, bias=False)
+        self.time_in = nn.Linear(2 * NUM_TIME_FREQUENCIES, hidden_size, bias=False)
+        nn.init.zeros_(self.time_in.weight)
         self.register_buffer(
             "time_frequencies", torch.exp(torch.linspace(-5.0, 5.0, NUM_TIME_FREQUENCIES)), persistent=False
         )
@@ -128,7 +128,7 @@ class NoisyStream(nn.Module):
         scale = torch.rsqrt(alpha.square() / self.diffusion_dim + sigma.square()).unsqueeze(-1)
         angles = self.gamma(t).float().unsqueeze(-1) * self.time_frequencies
         time_features = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        return self.input_proj(latents.float() * scale) + self.time_proj(time_features)
+        return self.latent_in(latents.float() * scale) + self.time_in(time_features)
 
 
 def _noisy_stream_hook(embedding: nn.Module, args: tuple[Any, ...], output: torch.Tensor) -> torch.Tensor:
