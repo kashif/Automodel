@@ -439,8 +439,15 @@ class ModelState:
         # @akoumpa: the second is_peft statement above keeps buffers in the state dict
         # this filtering removes them.
         # TODO: this is a hack and we should find a better way to do this.
+        # Parameters kept trainable next to the adapter (``freeze_config.unfreeze_modules``) are saved with it.
         if self.is_peft:
-            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            trainable = {
+                canonical_parameter_fqn(name)
+                for part in self.model
+                for name, param in part.named_parameters()
+                if param.requires_grad
+            }
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k or k in trainable}
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the

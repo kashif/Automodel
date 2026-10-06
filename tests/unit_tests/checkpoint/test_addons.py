@@ -248,6 +248,29 @@ def test_model_state_drops_lm_head_when_storage_shared():
     assert "model.embed_tokens.weight" in state_dict
 
 
+def test_peft_model_state_keeps_trainable_non_lora_params():
+    """PEFT saves keep LoRA weights plus unfrozen parameters, and drop frozen weights and buffers."""
+
+    class _DummyConfig:
+        tie_word_embeddings = False
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _DummyConfig()
+            self.base = nn.Linear(2, 2)
+            self.lora_A = nn.Linear(2, 1, bias=False)
+            self.extra = nn.Linear(2, 2, bias=False)
+            self.register_buffer("stats", torch.zeros(2))
+
+    model = _DummyModel()
+    model.base.requires_grad_(False)
+
+    state_dict = ModelState(model, is_peft=True).state_dict()
+
+    assert set(state_dict) == {"base_model.model.lora_A.weight", "base_model.model.extra.weight"}
+
+
 def test_peft_model_state_can_skip_default_group_broadcast():
     """Subset-mesh ranks already load PEFT state and must not broadcast globally."""
 
